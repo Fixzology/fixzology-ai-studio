@@ -1,174 +1,132 @@
-import { TimelineClip } from '@fixzology/core';
+import { FixzologyProject, TimelineClip } from '@fixzology/core';
 
-export type TransitionType = 'none' | 'fade' | 'dissolve' | 'wipe-left' | 'wipe-right' | 'slide-up' | 'zoom-in';
-export type VisualEffectType = 'none' | 'blur' | 'vignette' | 'retro' | 'glitch' | 'cinematic-bars';
-
-export interface ClipTransitionConfig {
-  inType: TransitionType;
-  inDurationMs: number;
-  outType: TransitionType;
-  outDurationMs: number;
+export interface AudioTrackSettings {
+  eqLowDb: number;    // -12 to +12 dB (Bass)
+  eqMidDb: number;    // -12 to +12 dB (Voice clarity)
+  eqHighDb: number;   // -12 to +12 dB (Treble)
+  autoDucking: boolean; // Voice-over चलने पर म्यूजिक को -10dB कम करना
 }
 
-export interface ClipEffectConfig {
-  type: VisualEffectType;
-  intensity: number; // 0 to 100
-}
+export class MultiTrackAudioEngine {
+  private audioBuffers = new Map<string, AudioBuffer>();
+  private decodeCtx = new AudioContext({ sampleRate: 48000 });
 
-export const COLOR_GRADING_PRESETS: Record<string, TimelineClip['colorAdjustments']> = {
-  NATURAL: {
-    exposure: 0,
-    contrast: 0,
-    saturation: 0,
-    temperature: 0,
-    tint: 0,
-    highlights: 0,
-    shadows: 0,
-  },
-  CINEMATIC_TEAL_ORANGE: {
-    exposure: 0.05,
-    contrast: 18,
-    saturation: 12,
-    temperature: 14,
-    tint: -6,
-    highlights: -10,
-    shadows: 8,
-  },
-  WARM_GOLDEN: {
-    exposure: 0.1,
-    contrast: 10,
-    saturation: 20,
-    temperature: 28,
-    tint: 5,
-    highlights: 5,
-    shadows: 0,
-  },
-  MOODY_DARK: {
-    exposure: -0.15,
-    contrast: 25,
-    saturation: -18,
-    temperature: -12,
-    tint: 0,
-    highlights: -20,
-    shadows: -15,
-  },
-  VIBRANT_REELS: {
-    exposure: 0.08,
-    contrast: 14,
-    saturation: 30,
-    temperature: 6,
-    tint: 2,
-    highlights: 10,
-    shadows: 10,
-  },
-};
+  /**
+   * प्रोजेक्ट के सभी ऑडियो और वीडियो क्लिप्स से ऑडियो डिकोड करके कैश करता है
+   */
+  public async loadProjectAudio(project: FixzologyProject): Promise<void> {
+    for (const asset of Object.values(project.assets)) {
+      if (this.audioBuffers.has(asset.id)) continue;
+      if (!asset.mimeType.startsWith('audio/') && !asset.mimeType.startsWith('video/')) continue;
 
-/**
- * किसी क्लिप के लिए पूर्ण CSS/Canvas Color Grading Filter स्ट्रिंग बनाता है
- */
-export function buildColorFilterString(
-  adj: TimelineClip['colorAdjustments'],
-  effect?: ClipEffectConfig,
-  bypassBeforeAfter = false
-): string {
-  if (bypassBeforeAfter) return 'none';
-
-  const brightness = Math.max(10, 100 + adj.exposure * 50 + (adj.highlights - adj.shadows) * 0.15);
-  const contrast = Math.max(10, 100 + adj.contrast);
-  const saturate = Math.max(0, 100 + adj.saturation);
-  const sepia = adj.temperature > 0 ? Math.min(40, adj.temperature * 0.6) : 0;
-  const hueRotate = adj.tint * 0.5 + (adj.temperature < 0 ? adj.temperature * 0.4 : 0);
-
-  let filter = `brightness(${brightness}%) contrast(${contrast}%) saturate(${saturate}%) sepia(${sepia}%) hue-rotate(${hueRotate}deg)`;
-
-  if (effect) {
-    if (effect.type === 'blur') {
-      filter += ` blur(${(effect.intensity / 100) * 16}px)`;
-    } else if (effect.type === 'retro') {
-      filter += ` sepia(${Math.min(90, effect.intensity)}%) contrast(110%)`;
+      try {
+        const res = await fetch(asset.sourceUri);
+        const arrayBuf = await res.arrayBuffer();
+        const audioBuf = await this.decodeCtx.decodeAudioData(arrayBuf);
+        this.audioBuffers.set(asset.id, audioBuf);
+      } catch {
+        // Silent video या unsupported audio track को सुरक्षित रूप से छोड़ें
+      }
     }
   }
 
-  return filter;
-}
+  /**
+   * पूरे प्रोजेक्ट के ऑडियो को OfflineAudioContext में सटीक टाइमिंग के साथ मिक्स करता है
+   * (Export के समय MP4 में असली आवाज जोड़ने के लिए)
+   */
+  public async renderMixedAudioBuffer(
+    project: FixzologyProject,
+    totalDurationSec: number,
+    trackEqMap: Record<string, AudioTrackSettings> = {}
+  ): Promise<AudioBuffer> {
+    const sampleRate = project.settings.sampleRate || 48000;
+    const totalSamples = Math.max(1, Math.ceil(totalDurationSec * sampleRate));
+    const offlineCtx = new OfflineAudioContext(2, totalSamples, sampleRate);
 
-/**
- * क्लिप के शुरू (In) और अंत (Out) में Transition लागू करता है
- */
-export function applyClipTransition(
-  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
-  width: number,
-  height: number,
-  localTimeMs: number,
-  totalDurationMs: number,
-  transition?: ClipTransitionConfig
-) {
-  if (!transition) return;
+    const trackMap = new Map(project.tracks.map((t) => [t.id, t]));
+    const hasAnySolo = project.tracks.some((t) => t.solo);
 
-  // Entrance Transition
-  if (transition.inType !== 'none' && transition.inDurationMs > 0 && localTimeMs < transition.inDurationMs) {
-    const p = Math.max(0, Math.min(1, localTimeMs / transition.inDurationMs));
-    applyTransitionProgress(ctx, width, height, transition.inType, p);
-  }
+    // Voice-over क्लिप्स की टाइमिंग निकालें (Auto-Ducking के लिए)
+    const voiceClips = Object.values(project.clips).filter((c) => {
+      const tr = trackMap.get(c.trackId);
+      return tr && tr.type === 'audio' && tr.name.toLowerCase().includes('voice');
+    });
 
-  // Exit Transition
-  const timeLeftMs = totalDurationMs - localTimeMs;
-  if (transition.outType !== 'none' && transition.outDurationMs > 0 && timeLeftMs < transition.outDurationMs) {
-    const p = Math.max(0, Math.min(1, timeLeftMs / transition.outDurationMs));
-    applyTransitionProgress(ctx, width, height, transition.outType, p);
-  }
-}
+    for (const clip of Object.values(project.clips)) {
+      if (!clip.assetId || clip.audioConfig?.muted) continue;
 
-function applyTransitionProgress(
-  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
-  width: number,
-  height: number,
-  type: TransitionType,
-  progress: number // 0 = hidden, 1 = fully visible
-) {
-  if (type === 'fade' || type === 'dissolve') {
-    ctx.globalAlpha *= progress;
-  } else if (type === 'wipe-left') {
-    ctx.beginPath();
-    ctx.rect(-width / 2, -height / 2, width * progress, height);
-    ctx.clip();
-  } else if (type === 'wipe-right') {
-    const visibleW = width * progress;
-    ctx.beginPath();
-    ctx.rect(width / 2 - visibleW, -height / 2, visibleW, height);
-    ctx.clip();
-  } else if (type === 'slide-up') {
-    ctx.translate(0, (1 - progress) * height * 0.4);
-    ctx.globalAlpha *= progress;
-  } else if (type === 'zoom-in') {
-    const s = 0.6 + 0.4 * progress;
-    ctx.scale(s, s);
-    ctx.globalAlpha *= progress;
-  }
-}
+      const track = trackMap.get(clip.trackId);
+      if (!track || track.muted) continue;
+      if (hasAnySolo && !track.solo) continue;
 
-/**
- * Post-draw Overlays (Vignette, Cinematic Letterbox Bars, Glitch Split)
- */
-export function applyPostFrameOverlay(
-  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
-  width: number,
-  height: number,
-  effect?: ClipEffectConfig
-) {
-  if (!effect || effect.type === 'none') return;
+      const buffer = this.audioBuffers.get(clip.assetId);
+      if (!buffer) continue;
 
-  if (effect.type === 'vignette') {
-    const radius = Math.max(width, height) * 0.7;
-    const grad = ctx.createRadialGradient(width / 2, height / 2, radius * 0.35, width / 2, height / 2, radius);
-    grad.addColorStop(0, 'rgba(0,0,0,0)');
-    grad.addColorStop(1, `rgba(0,0,0,${Math.min(0.9, effect.intensity / 100)})`);
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, width, height);
-  } else if (effect.type === 'cinematic-bars') {
-    const barHeight = Math.round(height * 0.12 * (effect.intensity / 100));
-    ctx.fillStyle = '#000000';
-    ctx.fillRect(0, 0, width, barHeight);
-    ctx.fillRect(0, height - barHeight, width, barHeight);
+      const source = offlineCtx.createBufferSource();
+      source.buffer = buffer;
+      source.playbackRate.value = clip.speed || 1;
+
+      // 1. Gain & Fade-In / Fade-Out Node
+      const gainNode = offlineCtx.createGain();
+      const baseLinearGain = Math.pow(10, (clip.audioConfig?.gainDb ?? 0) / 20);
+      const startSec = clip.startTimeMs / 1000;
+      const durationSec = clip.durationMs / 1000;
+      const endSec = startSec + durationSec;
+
+      const fadeInSec = Math.min(durationSec / 2, (clip.audioConfig?.fadeInMs ?? 0) / 1000);
+      const fadeOutSec = Math.min(durationSec / 2, (clip.audioConfig?.fadeOutMs ?? 0) / 1000);
+
+      if (fadeInSec > 0) {
+        gainNode.gain.setValueAtTime(0.0001, startSec);
+        gainNode.gain.linearRampToValueAtTime(baseLinearGain, startSec + fadeInSec);
+      } else {
+        gainNode.gain.setValueAtTime(baseLinearGain, startSec);
+      }
+
+      if (fadeOutSec > 0) {
+        gainNode.gain.setValueAtTime(baseLinearGain, Math.max(startSec, endSec - fadeOutSec));
+        gainNode.gain.linearRampToValueAtTime(0.0001, endSec);
+      }
+
+      // 2. Auto-Ducking: अगर यह म्यूजिक ट्रैक है और ऊपर Voice-over चल रहा है, तो आवाज धीमी करें
+      const eqSettings = trackEqMap[track.id];
+      if (eqSettings?.autoDucking && !track.name.toLowerCase().includes('voice')) {
+        for (const vc of voiceClips) {
+          const vStart = vc.startTimeMs / 1000;
+          const vEnd = (vc.startTimeMs + vc.durationMs) / 1000;
+          if (vEnd > startSec && vStart < endSec) {
+            gainNode.gain.setValueAtTime(baseLinearGain * 0.25, Math.max(startSec, vStart));
+            gainNode.gain.setValueAtTime(baseLinearGain, Math.min(endSec, vEnd));
+          }
+        }
+      }
+
+      // 3. 3-Band Equalizer (Low / Mid / High)
+      const lowFilter = offlineCtx.createBiquadFilter();
+      lowFilter.type = 'lowshelf';
+      lowFilter.frequency.value = 200;
+      lowFilter.gain.value = eqSettings?.eqLowDb ?? 0;
+
+      const midFilter = offlineCtx.createBiquadFilter();
+      midFilter.type = 'peaking';
+      midFilter.frequency.value = 1500;
+      midFilter.gain.value = eqSettings?.eqMidDb ?? 0;
+
+      const highFilter = offlineCtx.createBiquadFilter();
+      highFilter.type = 'highshelf';
+      highFilter.frequency.value = 6000;
+      highFilter.gain.value = eqSettings?.eqHighDb ?? 0;
+
+      source.connect(lowFilter);
+      lowFilter.connect(midFilter);
+      midFilter.connect(highFilter);
+      highFilter.connect(gainNode);
+      gainNode.connect(offlineCtx.destination);
+
+      const offsetSec = clip.sourceInMs / 1000;
+      source.start(startSec, offsetSec, durationSec * (clip.speed || 1));
+    }
+
+    return await offlineCtx.startRendering();
   }
 }
