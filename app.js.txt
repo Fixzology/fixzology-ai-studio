@@ -1,0 +1,298 @@
+import { LicenseManager } from './crypto-license.js';
+import { ProjectStorage } from './project-db.js';
+import { TimelineEngine } from './timeline-engine.js';
+
+const engine = new TimelineEngine();
+let playheadSec = 0;
+let isPlaying = false;
+let selectedClipId = null;
+let zoomPx = 45;
+let playTimer = null;
+
+// DOM Elements
+const legalModal = document.getElementById('legal-modal');
+const authModal = document.getElementById('auth-modal');
+const acceptLegalBtn = document.getElementById('accept-legal-btn');
+const loginForm = document.getElementById('login-form');
+const authError = document.getElementById('auth-error');
+const deviceIdBadge = document.getElementById('device-id-badge');
+
+const projectTitleInput = document.getElementById('project-title');
+const autosaveBadge = document.getElementById('autosave-badge');
+const licenseBadge = document.getElementById('license-badge');
+const fileInput = document.getElementById('media-file-input');
+const assetListEl = document.getElementById('asset-list');
+const timelineContainer = document.getElementById('timeline-tracks');
+const monitorBox = document.getElementById('monitor-box');
+const timecodeDisplay = document.getElementById('timecode-display');
+
+async function bootApp() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  }
+
+  const deviceHash = await LicenseManager.getDeviceFingerprint();
+  if (deviceIdBadge) deviceIdBadge.textContent = `Device ID: ${deviceHash}`;
+
+  // 1. Mandatory Legal Consent Check
+  if (localStorage.getItem('fxz_legal_consent_v1') !== 'true') {
+    legalModal.style.display = 'flex';
+    return;
+  }
+  legalModal.style.display = 'none';
+
+  // 2. License & Single-Device Verification
+  const sessionCheck = await LicenseManager.validateCurrentSession();
+  if (!sessionCheck.valid) {
+    authModal.style.display = 'flex';
+    return;
+  }
+
+  authModal.style.display = 'none';
+  licenseBadge.textContent = `${sessionCheck.record.plan} • ${sessionCheck.record.email}`;
+
+  // 3. Crash Recovery / Load Latest Autosaved Project
+  const savedProjects = await ProjectStorage.listProjects();
+  if (savedProjects.length > 0) {
+    savedProjects.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    engine.project = savedProjects[0];
+    projectTitleInput.value = engine.project.title;
+  }
+
+  renderAll();
+}
+
+acceptLegalBtn.addEventListener('click', () => {
+  localStorage.setItem('fxz_legal_consent_v1', 'true');
+  bootApp();
+});
+
+loginForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  authError.textContent = '';
+  const email = document.getElementById('login-email').value;
+  const key = document.getElementById('login-key').value;
+  const isOwner = document.getElementById('login-owner-mode').checked;
+
+  try {
+    await LicenseManager.activateLicense({
+      email,
+      licenseKey: key,
+      plan: isOwner ? 'OWNER_LIFETIME' : 'PRO',
+      isOwner
+    });
+    bootApp();
+  } catch (err) {
+    authError.textContent = err.message;
+  }
+});
+
+async function triggerAutosave() {
+  engine.project.title = projectTitleInput.value || 'Untitled Project';
+  await ProjectStorage.saveProject(engine.project);
+  autosaveBadge.textContent = `Saved ${new Date().toLocaleTimeString()}`;
+}
+
+// Media Import
+document.getElementById('btn-import').addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files || []);
+  files.forEach((f) => engine.importLocalFile(f));
+  e.target.value = '';
+  await triggerAutosave();
+  renderAll();
+});
+
+// Add Hindi / English Title
+document.getElementById('btn-add-text').addEventListener('click', async () => {
+  const customText = prompt('Enter Title Text (Hindi / Hinglish / English):', 'Fixzology AI Studio • नया वीडियो');
+  if (!customText) return;
+  const clip = engine.addTextClip(customText, playheadSec);
+  selectedClipId = clip.id;
+  await triggerAutosave();
+  renderAll();
+});
+
+// Split at Playhead
+document.getElementById('btn-split').addEventListener('click', async () => {
+  if (!selectedClipId) return;
+  if (engine.splitClipAt(selectedClipId, playheadSec)) {
+    await triggerAutosave();
+    renderAll();
+  }
+});
+
+// Delete Clip
+document.getElementById('btn-delete').addEventListener('click', async () => {
+  if (!selectedClipId) return;
+  if (engine.deleteClip(selectedClipId)) {
+    selectedClipId = null;
+    await triggerAutosave();
+    renderAll();
+  }
+});
+
+// Undo / Redo
+document.getElementById('btn-undo').addEventListener('click', async () => {
+  if (engine.undo()) {
+    await triggerAutosave();
+    renderAll();
+  }
+});
+
+document.getElementById('btn-redo').addEventListener('click', async () => {
+  if (engine.redo()) {
+    await triggerAutosave();
+    renderAll();
+  }
+});
+
+// Export .fxz Project File
+document.getElementById('btn-export-fxz').addEventListener('click', () => {
+  ProjectStorage.exportFxzFile(engine.project);
+});
+
+// Play / Pause Transport
+document.getElementById('btn-play').addEventListener('click', () => {
+  isPlaying = !isPlaying;
+  document.getElementById('btn-play').textContent = isPlaying ? '⏸ Pause' : '▶ Play';
+  if (isPlaying) {
+    playTimer = setInterval(() => {
+      playheadSec = Number((playheadSec + 0.05).toFixed(2));
+      updatePreviewAndPlayhead();
+    }, 50);
+  } else {
+    clearInterval(playTimer);
+  }
+});
+
+document.getElementById('zoom-slider').addEventListener('input', (e) => {
+  zoomPx = Number(e.target.value);
+  renderTimeline();
+});
+
+projectTitleInput.addEventListener('change', triggerAutosave);
+
+function renderAll() {
+  renderAssets();
+  renderTimeline();
+  updatePreviewAndPlayhead();
+}
+
+function renderAssets() {
+  assetListEl.innerHTML = '';
+  if (engine.project.assets.length === 0) {
+    assetListEl.innerHTML = '<p style="font-size:0.78rem;color:#9CA3AF;">No media imported yet. Click "+ Import Media" to load local video, audio, or images.</p>';
+    return;
+  }
+  engine.project.assets.forEach((asset) => {
+    const div = document.createElement('div');
+    div.style.cssText = 'padding:6px 8px;background:#262930;border-radius:5px;margin-bottom:6px;font-size:0.78rem;';
+    div.textContent = `[${asset.type.toUpperCase()}] ${asset.name}`;
+    assetListEl.appendChild(div);
+  });
+}
+
+function renderTimeline() {
+  timelineContainer.innerHTML = '';
+  engine.project.tracks.forEach((track) => {
+    const row = document.createElement('div');
+    row.className = 'track-row';
+
+    const header = document.createElement('div');
+    header.className = 'track-header';
+    header.innerHTML = `<span>${track.name}</span>`;
+
+    const lockBtn = document.createElement('button');
+    lockBtn.className = 'btn';
+    lockBtn.style.padding = '2px 6px';
+    lockBtn.textContent = track.locked ? '🔒' : '🔓';
+    lockBtn.onclick = () => {
+      track.locked = !track.locked;
+      renderTimeline();
+    };
+    header.appendChild(lockBtn);
+
+    const lane = document.createElement('div');
+    lane.className = 'track-lane';
+    lane.onclick = (e) => {
+      const rect = lane.getBoundingClientRect();
+      playheadSec = Math.max(0, Number(((e.clientX - rect.left) / zoomPx).toFixed(2)));
+      updatePreviewAndPlayhead();
+    };
+
+    engine.project.clips
+      .filter((c) => c.trackId === track.id)
+      .forEach((clip) => {
+        const block = document.createElement('div');
+        block.className = 'clip-block' + (clip.id === selectedClipId ? ' selected' : '');
+        block.style.left = `${clip.startSec * zoomPx}px`;
+        block.style.width = `${Math.max(24, clip.durationSec * zoomPx)}px`;
+        block.style.background = clip.color;
+        block.textContent = clip.label;
+        block.onclick = (e) => {
+          e.stopPropagation();
+          selectedClipId = clip.id;
+          renderTimeline();
+        };
+        lane.appendChild(block);
+      });
+
+    const playhead = document.createElement('div');
+    playhead.className = 'playhead-line';
+    playhead.style.left = `${playheadSec * zoomPx}px`;
+    lane.appendChild(playhead);
+
+    row.appendChild(header);
+    row.appendChild(lane);
+    timelineContainer.appendChild(row);
+  });
+}
+
+function updatePreviewAndPlayhead() {
+  timecodeDisplay.textContent = `${playheadSec.toFixed(2)}s`;
+  document.querySelectorAll('.playhead-line').forEach((el) => {
+    el.style.left = `${playheadSec * zoomPx}px`;
+  });
+
+  const activeClips = engine.project.clips.filter(
+    (c) => playheadSec >= c.startSec && playheadSec <= c.startSec + c.durationSec
+  );
+
+  monitorBox.innerHTML = '';
+  if (activeClips.length === 0) {
+    monitorBox.innerHTML = `<span style="color:#6B7280;font-size:0.82rem;">Preview Monitor • 16:9 • ${playheadSec.toFixed(2)}s</span>`;
+    return;
+  }
+
+  activeClips.forEach((clip) => {
+    if (clip.type === 'text') {
+      const txtDiv = document.createElement('div');
+      txtDiv.className = 'overlay-text-preview';
+      txtDiv.textContent = clip.textContent;
+      monitorBox.appendChild(txtDiv);
+    } else if (clip.type === 'image') {
+      const url = engine.objectUrls.get(clip.assetId);
+      if (url) {
+        const img = document.createElement('img');
+        img.src = url;
+        monitorBox.appendChild(img);
+      }
+    } else if (clip.type === 'video') {
+      const url = engine.objectUrls.get(clip.assetId);
+      if (url) {
+        const vid = document.createElement('video');
+        vid.src = url;
+        vid.muted = true;
+        monitorBox.appendChild(vid);
+      } else {
+        const notice = document.createElement('div');
+        notice.style.cssText = 'color:#9CA3AF;font-size:0.8rem;';
+        notice.textContent = `Offline Clip Reference: ${clip.label} (Relink local file if reloaded)`;
+        monitorBox.appendChild(notice);
+      }
+    }
+  });
+}
+
+bootApp();

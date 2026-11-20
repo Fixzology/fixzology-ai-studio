@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fixzology AI Studio — Phase 1 Foundation</title>
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="stylesheet" href="./css/studio.css" />
+</head>
+<body>
+
+  <!-- Mandatory Legal & Privacy Consent Gate -->
+  <div id="legal-modal" class="overlay-modal" style="display:none;">
+    <div class="modal-card">
+      <h2>Fixzology AI Studio — Legal & Privacy Consent (v1.0)</h2>
+      <p>Before first login, please review and accept our core agreements:</p>
+      <ul>
+        <li><strong>Single-Device License:</strong> Each customer license activates on 1 approved device for 1 year.</li>
+        <li><strong>Offline Media Privacy:</strong> Your raw footage stays 100% on your device during offline editing.</li>
+        <li><strong>AI Disclosure:</strong> Online AI editing only processes media after your explicit upload and approval.</li>
+        <li><strong>Copyright Policy:</strong> Users must own or hold rights to imported footage and audio.</li>
+      </ul>
+      <button id="accept-legal-btn" class="btn btn-primary" style="width:100%;">I Agree & Continue to Login</button>
+    </div>
+  </div>
+
+  <!-- Customer & Owner Login / License Activation Modal -->
+  <div id="auth-modal" class="overlay-modal" style="display:none;">
+    <div class="modal-card">
+      <h2>Activate Fixzology AI Studio License</h2>
+      <p id="device-id-badge" style="font-family:monospace;color:#00D2D3;"></p>
+      <form id="login-form">
+        <input id="login-email" type="email" class="input-field" placeholder="Registered Email Address" required />
+        <input id="login-key" type="text" class="input-field" placeholder="License Key (e.g. FXZ-2026-PRO-XXXX)" required />
+        <label style="display:flex;align-items:center;gap:8px;font-size:0.8rem;margin-bottom:12px;color:#9CA3AF;">
+          <input id="login-owner-mode" type="checkbox" /> Owner Admin Access (Lifetime)
+        </label>
+        <p id="auth-error" style="color:#EF4444;font-size:0.8rem;"></p>
+        <button type="submit" class="btn btn-primary" style="width:100%;">Activate & Enter Studio</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Top Bar -->
+  <header class="topbar">
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span class="brand-title">FIXZOLOGY AI STUDIO</span>
+      <input id="project-title" class="input-field" style="width:170px;margin:0;padding:4px 8px;" value="New Fixzology Project" />
+      <span id="autosave-badge" class="status-pill">Local Ready</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <span id="license-badge" class="status-pill" style="color:#fff;">Checking License...</span>
+      <button id="btn-export-fxz" class="btn">Save .fxz Backup</button>
+    </div>
+  </header>
+
+  <!-- Main Workspace -->
+  <div class="workspace">
+    <aside class="sidebar">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <strong style="font-size:0.82rem;">MEDIA & TOOLS</strong>
+        <button id="btn-import" class="btn btn-primary">+ Import Media</button>
+        <input id="media-file-input" type="file" multiple accept="video/*,audio/*,image/*" style="display:none;" />
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:12px;">
+        <button id="btn-add-text" class="btn">+ Text (HI/EN)</button>
+        <button id="btn-split" class="btn">✂ Split Clip</button>
+        <button id="btn-delete" class="btn">🗑 Delete Clip</button>
+        <button id="btn-undo" class="btn">↩ Undo</button>
+      </div>
+      <div id="asset-list" style="flex:1;overflow-y:auto;"></div>
+    </aside>
+
+    <main class="preview-area">
+      <div id="monitor-box" class="monitor-box"></div>
+      <div class="transport-bar">
+        <button id="btn-redo" class="btn">↪ Redo</button>
+        <button id="btn-play" class="btn btn-teal">▶ Play</button>
+        <span id="timecode-display" style="font-family:monospace;font-size:0.85rem;color:#00D2D3;">0.00s</span>
+      </div>
+    </main>
+  </div>
+
+  <!-- Bottom Timeline -->
+  <section class="timeline-dock">
+    <div class="timeline-toolbar">
+      <span>MULTI-TRACK TIMELINE (Click lane to move playhead)</span>
+      <label style="display:flex;align-items:center;gap:6px;">
+        Zoom <input id="zoom-slider" type="range" min="20" max="120" value="45" />
+      </label>
+    </div>
+    <div id="timeline-tracks" class="timeline-tracks"></div>
+  </section>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
