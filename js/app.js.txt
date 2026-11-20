@@ -1,0 +1,387 @@
+import { LicenseManager } from './crypto-license.js';
+import { ProjectStorage } from './project-db.js';
+import { TimelineEngine } from './timeline-engine.js';
+import { StudioCompositor } from './compositor.js';
+import { ExportEngine } from './export-engine.js';
+
+const engine = new TimelineEngine();
+const monitorCanvas = document.getElementById('monitor-canvas');
+const compositor = new StudioCompositor(monitorCanvas, engine);
+
+let playheadSec = 0;
+let isPlaying = false;
+let selectedClipId = null;
+let zoomPx = 45;
+let rafId = null;
+let lastTickMs = 0;
+
+// Modals & UI Refs
+const legalModal = document.getElementById('legal-modal');
+const authModal = document.getElementById('auth-modal');
+const exportModal = document.getElementById('export-modal');
+const projectTitleInput = document.getElementById('project-title');
+const autosaveBadge = document.getElementById('autosave-badge');
+const licenseBadge = document.getElementById('license-badge');
+const fileInput = document.getElementById('media-file-input');
+const assetListEl = document.getElementById('asset-list');
+const timelineContainer = document.getElementById('timeline-tracks');
+const timecodeDisplay = document.getElementById('timecode-display');
+const inspectorContent = document.getElementById('inspector-content');
+
+async function bootApp() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  }
+
+  const deviceHash = await LicenseManager.getDeviceFingerprint();
+  document.getElementById('device-id-badge').textContent = `Device ID: ${deviceHash}`;
+
+  if (localStorage.getItem('fxz_legal_consent_v1') !== 'true') {
+    legalModal.style.display = 'flex';
+    return;
+  }
+  legalModal.style.display = 'none';
+
+  const sessionCheck = await LicenseManager.validateCurrentSession();
+  if (!sessionCheck.valid) {
+    authModal.style.display = 'flex';
+    return;
+  }
+  authModal.style.display = 'none';
+  licenseBadge.textContent = `${sessionCheck.record.plan} • ${sessionCheck.record.email}`;
+
+  const savedProjects = await ProjectStorage.listProjects();
+  if (savedProjects.length > 0) {
+    savedProjects.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    engine.project = savedProjects[0];
+    projectTitleInput.value = engine.project.title;
+  }
+
+  renderAll();
+}
+
+document.getElementById('accept-legal-btn').addEventListener('click', () => {
+  localStorage.setItem('fxz_legal_consent_v1', 'true');
+  bootApp();
+});
+
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const email = document.getElementById('login-email').value;
+  const key = document.getElementById('login-key').value;
+  const isOwner = document.getElementById('login-owner-mode').checked;
+  try {
+    await LicenseManager.activateLicense({ email, licenseKey: key, plan: isOwner ? 'OWNER_LIFETIME' : 'PRO', isOwner });
+    bootApp();
+  } catch (err) {
+    document.getElementById('auth-error').textContent = err.message;
+  }
+});
+
+async function triggerAutosave() {
+  engine.project.title = projectTitleInput.value || 'Untitled Project';
+  await ProjectStorage.saveProject(engine.project);
+  autosaveBadge.textContent = `Saved ${new Date().toLocaleTimeString()}`;
+}
+
+// Media Import
+document.getElementById('btn-import').addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files || []);
+  for (const f of files) {
+    const clip = await engine.importLocalFile(f);
+    selectedClipId = clip.id;
+  }
+  e.target.value = '';
+  await triggerAutosave();
+  renderAll();
+});
+
+// Add Hindi / English Title
+document.getElementById('btn-add-text').addEventListener('click', async () => {
+  const text = prompt('Enter Title Text (Hindi / Hinglish / English):', 'Fixzology AI Studio • नया वीडियो');
+  if (!text) return;
+  const clip = engine.addTextClip(text, playheadSec);
+  selectedClipId = clip.id;
+  await triggerAutosave();
+  renderAll();
+});
+
+// Split, Delete, Undo, Redo
+document.getElementById('btn-split').addEventListener('click', async () => {
+  if (selectedClipId && engine.splitClipAt(selectedClipId, playheadSec)) {
+    await triggerAutosave();
+    renderAll();
+  }
+});
+
+document.getElementById('btn-delete').addEventListener('click', async () => {
+  if (selectedClipId && engine.deleteClip(selectedClipId)) {
+    selectedClipId = null;
+    await triggerAutosave();
+    renderAll();
+  }
+});
+
+document.getElementById('btn-undo').addEventListener('click', async () => {
+  if (engine.undo()) {
+    await triggerAutosave();
+    renderAll();
+  }
+});
+
+document.getElementById('btn-redo').addEventListener('click', async () => {
+  if (engine.redo()) {
+    await triggerAutosave();
+    renderAll();
+  }
+});
+
+document.getElementById('btn-export-fxz').addEventListener('click', () => {
+  ProjectStorage.exportFxzFile(engine.project);
+});
+
+// Playback Loop (60fps Canvas Render)
+function playbackLoop(nowMs) {
+  if (!isPlaying) return;
+  const deltaSec = (nowMs - lastTickMs) / 1000;
+  lastTickMs = nowMs;
+  playheadSec = Number((playheadSec + deltaSec).toFixed(3));
+
+  const maxDur = engine.getTotalDurationSec();
+  if (maxDur > 0 && playheadSec >= maxDur) {
+    playheadSec = 0;
+    isPlaying = false;
+    document.getElementById('btn-play').textContent = '▶ Play';
+    compositor.syncMediaPlayback(0, false);
+    updateFrameAndPlayhead();
+    return;
+  }
+
+  updateFrameAndPlayhead();
+  rafId = requestAnimationFrame(playbackLoop);
+}
+
+document.getElementById('btn-play').addEventListener('click', () => {
+  isPlaying = !isPlaying;
+  document.getElementById('btn-play').textContent = isPlaying ? '⏸ Pause' : '▶ Play';
+  if (isPlaying) {
+    lastTickMs = performance.now();
+    rafId = requestAnimationFrame(playbackLoop);
+  } else {
+    cancelAnimationFrame(rafId);
+    compositor.syncMediaPlayback(playheadSec, false);
+  }
+});
+
+document.getElementById('zoom-slider').addEventListener('input', (e) => {
+  zoomPx = Number(e.target.value);
+  renderTimeline();
+});
+
+// Export Modal & Real Video Render
+document.getElementById('btn-open-export').addEventListener('click', () => {
+  document.getElementById('export-status').textContent = 'Ready to render locally on your device.';
+  document.getElementById('export-progress-fill').style.width = '0%';
+  document.getElementById('export-download-link').style.display = 'none';
+  exportModal.style.display = 'flex';
+});
+
+document.getElementById('btn-close-export').addEventListener('click', () => {
+  exportModal.style.display = 'none';
+});
+
+document.getElementById('btn-start-export').addEventListener('click', async () => {
+  const resHeight = Number(document.getElementById('export-resolution').value);
+  const fps = Number(document.getElementById('export-fps').value);
+  const statusEl = document.getElementById('export-status');
+  const fillEl = document.getElementById('export-progress-fill');
+  const dlLink = document.getElementById('export-download-link');
+
+  try {
+    isPlaying = false;
+    document.getElementById('btn-play').textContent = '▶ Play';
+    statusEl.textContent = 'Rendering video frames locally... Do not close this tab.';
+
+    const result = await ExportEngine.exportTimeline({
+      canvas: monitorCanvas,
+      engine,
+      compositor,
+      resolutionHeight: resHeight,
+      fps,
+      onProgress: (pct, cur, tot) => {
+        fillEl.style.width = `${pct}%`;
+        statusEl.textContent = `Rendering: ${pct}% (${cur.toFixed(1)}s / ${tot.toFixed(1)}s)`;
+      }
+    });
+
+    fillEl.style.width = '100%';
+    const mb = (result.sizeBytes / (1024 * 1024)).toFixed(2);
+    statusEl.textContent = `Export Complete! File Size: ${mb} MB (${result.mimeType})`;
+    dlLink.href = result.downloadUrl;
+    dlLink.download = result.fileName;
+    dlLink.textContent = `⬇ Download ${result.fileName}`;
+    dlLink.style.display = 'inline-block';
+  } catch (err) {
+    statusEl.textContent = `Export Error: ${err.message}`;
+  }
+});
+
+function renderAll() {
+  renderAssets();
+  renderTimeline();
+  renderInspector();
+  updateFrameAndPlayhead();
+}
+
+function renderAssets() {
+  assetListEl.innerHTML = '';
+  if (engine.project.assets.length === 0) {
+    assetListEl.innerHTML = '<p style="font-size:0.76rem;color:#9CA3AF;">Import MP4, WebM, MP3, WAV, or PNG files from your device.</p>';
+    return;
+  }
+  engine.project.assets.forEach((asset) => {
+    const div = document.createElement('div');
+    div.style.cssText = 'padding:6px 8px;background:#262930;border-radius:5px;margin-bottom:5px;font-size:0.76rem;';
+    div.textContent = `[${asset.type.toUpperCase()}] ${asset.name} (${asset.durationSec}s)`;
+    assetListEl.appendChild(div);
+  });
+}
+
+function renderInspector() {
+  const clip = engine.project.clips.find((c) => c.id === selectedClipId);
+  if (!clip) {
+    inspectorContent.innerHTML = '<p style="color:#9CA3AF;font-size:0.78rem;">Select any clip on the timeline to edit Transform, Speed, Color, Audio & Transitions.</p>';
+    return;
+  }
+  const p = clip.props;
+  inspectorContent.innerHTML = `
+    <div class="inspector-group">
+      <h4>Transform & Crop</h4>
+      <div class="slider-row">Scale / Zoom (${p.scale}x)
+        <input type="range" min="0.2" max="3" step="0.05" value="${p.scale}" data-prop="scale" />
+      </div>
+      <div class="slider-row">Rotation (${p.rotation}°)
+        <input type="range" min="-180" max="180" step="1" value="${p.rotation}" data-prop="rotation" />
+      </div>
+      <div class="slider-row">Opacity (${Math.round(p.opacity * 100)}%)
+        <input type="range" min="0" max="1" step="0.05" value="${p.opacity}" data-prop="opacity" />
+      </div>
+    </div>
+
+    <div class="inspector-group">
+      <h4>Speed & Audio</h4>
+      <div class="slider-row">Playback Speed (${p.speed}x)
+        <input type="range" min="0.25" max="3" step="0.25" value="${p.speed}" data-prop="speed" />
+      </div>
+      <div class="slider-row">Audio Volume (${Math.round(p.volume * 100)}%)
+        <input type="range" min="0" max="1" step="0.05" value="${p.volume}" data-prop="volume" />
+      </div>
+    </div>
+
+    <div class="inspector-group">
+      <h4>Color Grading & Transition</h4>
+      <div class="slider-row">Brightness (${p.brightness}%)
+        <input type="range" min="30" max="200" step="5" value="${p.brightness}" data-prop="brightness" />
+      </div>
+      <div class="slider-row">Contrast (${p.contrast}%)
+        <input type="range" min="30" max="200" step="5" value="${p.contrast}" data-prop="contrast" />
+      </div>
+      <div class="slider-row">Saturation (${p.saturation}%)
+        <input type="range" min="0" max="200" step="5" value="${p.saturation}" data-prop="saturation" />
+      </div>
+      <label style="font-size:0.75rem;color:#9CA3AF;">Entrance Transition</label>
+      <select class="input-field" id="prop-transition">
+        <option value="none" ${p.transitionIn === 'none' ? 'selected' : ''}>None</option>
+        <option value="fade" ${p.transitionIn === 'fade' ? 'selected' : ''}>Smooth Fade In</option>
+      </select>
+    </div>
+  `;
+
+  inspectorContent.querySelectorAll('input[data-prop]').forEach((input) => {
+    input.addEventListener('input', async (e) => {
+      const propName = e.target.dataset.prop;
+      engine.updateClipProps(clip.id, { [propName]: Number(e.target.value) });
+      renderTimeline();
+      updateFrameAndPlayhead();
+    });
+    input.addEventListener('change', triggerAutosave);
+  });
+
+  const transSelect = document.getElementById('prop-transition');
+  if (transSelect) {
+    transSelect.addEventListener('change', async (e) => {
+      engine.updateClipProps(clip.id, { transitionIn: e.target.value });
+      await triggerAutosave();
+      updateFrameAndPlayhead();
+    });
+  }
+}
+
+function renderTimeline() {
+  timelineContainer.innerHTML = '';
+  engine.project.tracks.forEach((track) => {
+    const row = document.createElement('div');
+    row.className = 'track-row';
+
+    const header = document.createElement('div');
+    header.className = 'track-header';
+    header.innerHTML = `<span>${track.name}</span>`;
+
+    const lockBtn = document.createElement('button');
+    lockBtn.className = 'btn';
+    lockBtn.style.padding = '2px 5px';
+    lockBtn.textContent = track.locked ? '🔒' : '🔓';
+    lockBtn.onclick = () => {
+      track.locked = !track.locked;
+      renderTimeline();
+    };
+    header.appendChild(lockBtn);
+
+    const lane = document.createElement('div');
+    lane.className = 'track-lane';
+    lane.onclick = (e) => {
+      const rect = lane.getBoundingClientRect();
+      playheadSec = Math.max(0, Number(((e.clientX - rect.left) / zoomPx).toFixed(2)));
+      updateFrameAndPlayhead();
+    };
+
+    engine.project.clips
+      .filter((c) => c.trackId === track.id)
+      .forEach((clip) => {
+        const block = document.createElement('div');
+        block.className = 'clip-block' + (clip.id === selectedClipId ? ' selected' : '');
+        block.style.left = `${clip.startSec * zoomPx}px`;
+        block.style.width = `${Math.max(24, clip.durationSec * zoomPx)}px`;
+        block.style.background = clip.color;
+        block.textContent = clip.label;
+        block.onclick = (e) => {
+          e.stopPropagation();
+          selectedClipId = clip.id;
+          renderTimeline();
+          renderInspector();
+        };
+        lane.appendChild(block);
+      });
+
+    const playhead = document.createElement('div');
+    playhead.className = 'playhead-line';
+    playhead.style.left = `${playheadSec * zoomPx}px`;
+    lane.appendChild(playhead);
+
+    row.appendChild(header);
+    row.appendChild(lane);
+    timelineContainer.appendChild(row);
+  });
+}
+
+function updateFrameAndPlayhead() {
+  timecodeDisplay.textContent = `${playheadSec.toFixed(2)}s`;
+  document.querySelectorAll('.playhead-line').forEach((el) => {
+    el.style.left = `${playheadSec * zoomPx}px`;
+  });
+  compositor.syncMediaPlayback(playheadSec, isPlaying);
+  compositor.renderFrame(playheadSec);
+}
+
+bootApp();
