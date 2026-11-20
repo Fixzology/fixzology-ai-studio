@@ -1,0 +1,128 @@
+import { MediaAssetRef } from '@fixzology/core';
+
+/**
+ * किसी भी लोकल वीडियो/ऑडियो/इमेज फाइल से असली Metadata, SHA-256 और Audio Waveform निकालता है।
+ * यह 100% ऑफलाइन और फ्री है (यूजर के डिवाइस पर चलता है)।
+ */
+export async function importLocalMediaFile(file: File): Promise<{
+  asset: MediaAssetRef;
+  objectUrl: string;
+}> {
+  // 1. Duplicate और Relink पहचानने के लिए SHA-256 हैश निकालें
+  const buffer = await file.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+  const sha256 = Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+
+  const objectUrl = URL.createObjectURL(file);
+  const id = crypto.randomUUID();
+
+  // 2. अगर Image फाइल है
+  if (file.type.startsWith('image/')) {
+    const dims = await getImageDimensions(objectUrl);
+    return {
+      objectUrl,
+      asset: {
+        id,
+        name: file.name,
+        mimeType: file.type,
+        sourceUri: objectUrl,
+        sha256,
+        durationMs: 5000, // डिफ़ॉल्ट 5 सेकंड टाइमलाइन पर
+        width: dims.width,
+        height: dims.height,
+      },
+    };
+  }
+
+  // 3. अगर Video या Audio फाइल है तो Metadata और Waveform निकालें
+  const isVideo = file.type.startsWith('video/');
+  const mediaMeta = isVideo
+    ? await probeVideoMetadata(objectUrl)
+    : await probeAudioDuration(objectUrl);
+
+  const waveformPeaks = await extractAudioWaveform(buffer, 120);
+
+  return {
+    objectUrl,
+    asset: {
+      id,
+      name: file.name,
+      mimeType: file.type,
+      sourceUri: objectUrl,
+      sha256,
+      durationMs: Math.round(mediaMeta.durationSec * 1000),
+      width: 'width' in mediaMeta ? mediaMeta.width : undefined,
+      height: 'height' in mediaMeta ? mediaMeta.height : undefined,
+      fps: 30,
+      sampleRate: 48000,
+      waveformPeaks,
+    },
+  };
+}
+
+function getImageDimensions(url: string): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+    img.onerror = () => reject(new Error('Image load failed'));
+    img.src = url;
+  });
+}
+
+function probeVideoMetadata(url: string): Promise<{ durationSec: number; width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.muted = true;
+    video.onloadedmetadata = () => {
+      resolve({
+        durationSec: video.duration || 0,
+        width: video.videoWidth,
+        height: video.videoHeight,
+      });
+    };
+    video.onerror = () => reject(new Error('Unsupported video format'));
+    video.src = url;
+  });
+}
+
+function probeAudioDuration(url: string): Promise<{ durationSec: number }> {
+  return new Promise((resolve, reject) => {
+    const audio = new Audio();
+    audio.preload = 'metadata';
+    audio.onloadedmetadata = () => resolve({ durationSec: audio.duration || 0 });
+    audio.onerror = () => reject(new Error('Unsupported audio format'));
+    audio.src = url;
+  });
+}
+
+/**
+ * Web Audio API से असली Audio Waveform Peaks (0 से 1 के बीच) निकालता है
+ */
+async function extractAudioWaveform(arrayBuffer: ArrayBuffer, samplesCount = 120): Promise<number[]> {
+  try {
+    const audioCtx = new OfflineAudioContext(1, 44100, 44100);
+    // ArrayBuffer की कॉपी भेजें क्योंकि decodeAudioData मूल बफर को detach कर देता है
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+    const rawData = audioBuffer.getChannelData(0);
+    const blockSize = Math.floor(rawData.length / samplesCount);
+    const peaks: number[] = [];
+
+    for (let i = 0; i < samplesCount; i++) {
+      let sum = 0;
+      const start = i * blockSize;
+      for (let j = 0; j < blockSize; j++) {
+        sum += Math.abs(rawData[start + j] || 0);
+      }
+      peaks.push(Number((sum / (blockSize || 1)).toFixed(3)));
+    }
+
+    const maxPeak = Math.max(...peaks, 0.01);
+    return peaks.map((p) => Number((p / maxPeak).toFixed(3)));
+  } catch {
+    // अगर वीडियो में ऑडियो ट्रैक नहीं है (Silent video)
+    return new Array(samplesCount).fill(0);
+  }
+}
