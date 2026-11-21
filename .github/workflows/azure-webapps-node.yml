@@ -70,7 +70,8 @@ jobs:
         name: node-app
     - name: Azure Login
       uses: azure/login@v1
-
+      with:
+        creds: ${{secrets.AZURE_CREDENTIALS}}
     - name: 'Deploy to Azure WebApp'
       id: deploy-to-webapp
       uses: azure/webapps-deploy@v2
